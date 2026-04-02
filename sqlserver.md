@@ -54,6 +54,31 @@ python manage.py import_sqlserver_cases
 python manage.py import_sqlserver_cases --limit 20
 ```
 
+ถ้าต้องการ sync เฉพาะข้อมูลที่อยู่ในช่วง N วันล่าสุด
+
+```bash
+python manage.py import_sqlserver_cases --days 7
+python manage.py sync_sqlserver_cases --days 7
+```
+
+สั่ง sync ล่าสุดด้วยชื่อคำสั่งที่ใช้กับ cron ได้ง่ายขึ้น
+
+```bash
+python manage.py sync_sqlserver_cases
+```
+
+ตัวอย่าง cron sync ทุกวันตอนตีสอง
+
+```cron
+0 2 * * * cd /Users/mac_it/Desktop/django-local-chatbot && /Users/mac_it/Desktop/django-local-chatbot/.venv312/bin/python manage.py sync_sqlserver_cases
+```
+
+ตัวอย่าง cron sync เฉพาะ 7 วันล่าสุดทุกวันตอนตีสอง
+
+```cron
+0 2 * * * cd /Users/mac_it/Desktop/django-local-chatbot && /Users/mac_it/Desktop/django-local-chatbot/.venv312/bin/python manage.py sync_sqlserver_cases --days 7
+```
+
 ## Notes
 
 - ค่าเริ่มต้นในโปรเจกต์นี้ใช้ `python-tds` (`SQLSERVER_CLIENT=pytds`) เพราะตั้งต้นง่ายกว่าและไม่ต้องพึ่ง ODBC driver ของระบบ
@@ -61,3 +86,4 @@ python manage.py import_sqlserver_cases --limit 20
 - ถ้าใช้ `pyodbc` บน macOS ต้องมี ODBC driver ของ SQL Server ให้พร้อมก่อน เช่น Microsoft ODBC Driver 18
 - คำสั่ง import ใช้ `CARD_ID` เป็นคีย์อ้างอิงคงที่ ถ้ารันซ้ำจะแก้เฉพาะแถวที่เปลี่ยนและข้ามแถวที่เหมือนเดิม
 - เอกสารที่ import จาก SQL Server จะถูกเก็บเป็น knowledge แบบ `shared`
+- โหมด `--days N` ในเวอร์ชันนี้ใช้คอลัมน์ `Create_date` เป็นตัวกรองข้อมูลล่าสุด

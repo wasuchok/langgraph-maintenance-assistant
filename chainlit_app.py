@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import uuid
 from pathlib import Path
@@ -17,6 +18,7 @@ import requests
 from asgiref.sync import sync_to_async
 from chainlit import make_async
 from chainlit.context import context as chainlit_context
+from django.conf import settings
 from django.contrib.auth import authenticate, get_user_model
 from django.core.exceptions import ObjectDoesNotExist
 from django.db.models import Q
@@ -46,6 +48,12 @@ from chatbot.services.knowledge_management_service import (
     list_knowledge_documents,
 )
 from chatbot.services.ollama_service import looks_like_followup_question
+from chatbot.services.sqlserver_case_ingestion_service import import_sqlserver_cases
+from chatbot.services.sqlserver_service import (
+    SQLServerConfigurationError,
+    SQLServerDependencyError,
+    is_sqlserver_configured,
+)
 
 list_user_conversations_async = make_async(list_user_conversations)
 get_conversation_messages_async = make_async(get_conversation_messages)
@@ -57,6 +65,7 @@ list_knowledge_documents_async = make_async(list_knowledge_documents)
 get_knowledge_document_summary_async = make_async(get_knowledge_document_summary)
 delete_knowledge_document_async = make_async(delete_knowledge_document)
 delete_all_knowledge_documents_async = make_async(delete_all_knowledge_documents)
+import_sqlserver_cases_async = make_async(import_sqlserver_cases)
 
 DOCUMENTS_PER_PAGE = 5
 CONVERSATIONS_PER_PAGE = 8
@@ -218,6 +227,21 @@ def build_upload_summary(upload_result: dict, visibility: str) -> str:
     return "\n".join(lines) if lines else "ไม่ได้รับไฟล์ที่ใช้เพิ่มฐานความรู้"
 
 
+def parse_sync_days_from_text(user_text: str) -> int | None:
+    normalized = (user_text or "").strip().lower()
+    if not normalized:
+        return None
+
+    if normalized in {"sync latest", "sync sql", "sync ล่าสุด", "ซิงก์ล่าสุด", "/syncsql"}:
+        return None
+
+    match = re.match(r"^/syncsql\s+(\d+)$", normalized)
+    if match:
+        return max(1, int(match.group(1)))
+
+    return None
+
+
 async def clear_visible_chat() -> None:
     for message in cl.chat_context.get():
         try:
@@ -240,6 +264,20 @@ def build_intro_actions(*, can_manage_knowledge: bool) -> list[cl.Action]:
                 name="knowledge_list",
                 payload={"offset": 0},
                 label="ดูรายการเอกสาร",
+            )
+        )
+        actions.append(
+            cl.Action(
+                name="knowledge_sync_sqlserver",
+                payload={"days": 7},
+                label="sync 7 วันล่าสุด",
+            )
+        )
+        actions.append(
+            cl.Action(
+                name="knowledge_sync_sqlserver",
+                payload={},
+                label="sync ทั้งหมด",
             )
         )
 
@@ -479,6 +517,21 @@ def build_management_actions(
         ),
     ]
 
+    actions.append(
+        cl.Action(
+            name="knowledge_sync_sqlserver",
+            payload={"days": 7},
+            label="sync 7 วันล่าสุด",
+        )
+    )
+    actions.append(
+        cl.Action(
+            name="knowledge_sync_sqlserver",
+            payload={},
+            label="sync ทั้งหมด",
+        )
+    )
+
     if manageable_total > 0:
         actions.append(
             cl.Action(
@@ -616,6 +669,16 @@ async def send_management_menu() -> None:
             label="ดูรายการเอกสาร",
         ),
         cl.Action(
+            name="knowledge_sync_sqlserver",
+            payload={"days": 7},
+            label="sync 7 วันล่าสุด",
+        ),
+        cl.Action(
+            name="knowledge_sync_sqlserver",
+            payload={},
+            label="sync ทั้งหมด",
+        ),
+        cl.Action(
             name="knowledge_delete_all_request",
             payload={"offset": 0},
             label="ลบเอกสารแชร์ทั้งหมด",
@@ -625,6 +688,99 @@ async def send_management_menu() -> None:
         content=f"เมนูจัดการฐานความรู้\nโหมดอัปโหลดตอนนี้: {current_visibility_label}",
         actions=actions,
     ).send()
+
+
+def get_sqlserver_cases_source_name() -> str:
+    schema = (settings.SQLSERVER_CASES_SCHEMA or "dbo").strip() or "dbo"
+    table = (settings.SQLSERVER_CASES_TABLE or "").strip()
+    return f"{schema}.{table}" if table else schema
+
+
+def build_sqlserver_sync_summary(result: dict) -> str:
+    summary = result["summary"]
+    schema = result["schema"]
+    table = result["table"]
+    days = result.get("days")
+    lines = [
+        f"sync SQL Server เสร็จแล้วจาก {schema}.{table}",
+        (
+            f"ช่วงข้อมูลล่าสุด: {days} วัน"
+            if days
+            else "ช่วงข้อมูลล่าสุด: ทั้งหมด"
+        ),
+        f"total rows: {summary.total_rows}",
+        f"created: {summary.created_count}",
+        f"updated: {summary.updated_count}",
+        f"skipped: {summary.skipped_count}",
+        f"errors: {summary.error_count}",
+    ]
+
+    errors = result.get("errors") or []
+    if errors:
+        lines.append("")
+        lines.append("ตัวอย่าง error สูงสุด 5 รายการ")
+        for item in errors[:5]:
+            lines.append(
+                f"- {item.get('card_id', '-')} : {item.get('error', 'unknown error')}"
+            )
+
+    return "\n".join(lines)
+
+
+async def run_sqlserver_sync(
+    *,
+    limit: int | None = None,
+    days: int | None = None,
+) -> None:
+    if not get_current_user_can_manage_all():
+        await cl.Message(content="บัญชีนี้ไม่มีสิทธิ์ sync ข้อมูลจาก SQL Server").send()
+        return
+
+    if not is_sqlserver_configured():
+        await cl.Message(content="ยังไม่ได้ตั้งค่า SQL Server ในไฟล์ .env").send()
+        return
+
+    schema = (settings.SQLSERVER_CASES_SCHEMA or "dbo").strip() or "dbo"
+    table = (settings.SQLSERVER_CASES_TABLE or "").strip()
+
+    if not table:
+        await cl.Message(content="ยังไม่ได้ตั้งค่า SQLSERVER_CASES_TABLE ในไฟล์ .env").send()
+        return
+
+    source_name = get_sqlserver_cases_source_name()
+    status_message = await cl.Message(
+        content=(
+            f"กำลัง sync ข้อมูลจาก {source_name} "
+            + (
+                f"(ล่าสุด {days} วัน)"
+                if days
+                else "(ทั้งหมด)"
+            )
+            + " เข้า knowledge base..."
+        )
+    ).send()
+
+    try:
+        result = await import_sqlserver_cases_async(
+            schema=schema,
+            table=table,
+            limit=limit,
+            days=days,
+        )
+    except (SQLServerConfigurationError, SQLServerDependencyError) as exc:
+        status_message.content = f"sync SQL Server ไม่สำเร็จ: {exc}"
+        await status_message.update()
+        return
+    except Exception as exc:
+        status_message.content = f"sync SQL Server ไม่สำเร็จ: {exc}"
+        await status_message.update()
+        return
+
+    status_message.content = build_sqlserver_sync_summary(result)
+    await status_message.update()
+
+    if cl.user_session.get(KNOWLEDGE_DASHBOARD_SESSION_KEY):
+        await send_knowledge_dashboard(0)
 
 
 @cl.password_auth_callback
@@ -667,7 +823,7 @@ async def on_chat_start() -> None:
         "พิมพ์คำถามได้เลย ระบบนี้จะใช้ Ollama และฐานความรู้ชุดเดียวกับ Django API เดิม\n"
         "ประวัติแชตของแต่ละบัญชีจะแยกจากกัน\n"
         + (
-            f"บัญชี admin สามารถเพิ่มข้อมูลเข้าฐานความรู้แบบ{current_visibility_label}ได้ทันที\n"
+            f"บัญชี admin สามารถเพิ่มข้อมูลเข้าฐานความรู้แบบ{current_visibility_label}ได้ทันที และกด sync SQL ล่าสุดได้\n"
             if can_manage_knowledge
             else "บัญชี user ใช้สำหรับถามคำถามจากฐานความรู้แบบแชร์เท่านั้น\n"
         )
@@ -727,6 +883,15 @@ async def on_message(message: cl.Message) -> None:
             await cl.Message(content="ตอนนี้ระบบเปิดให้ admin จัดการเฉพาะเอกสาร shared ครับ").send()
         else:
             await cl.Message(content="บัญชีนี้ไม่มีสิทธิ์จัดการเอกสาร").send()
+        return
+
+    sync_days = parse_sync_days_from_text(user_text)
+    if sync_days is not None:
+        await run_sqlserver_sync(days=sync_days)
+        return
+
+    if user_text in {"sync latest", "sync sql", "sync ล่าสุด", "ซิงก์ล่าสุด", "/syncsql"}:
+        await run_sqlserver_sync(days=7)
         return
 
     if user_text in {"ดูห้องสนทนา", "ดูห้องของฉัน", "/chats"}:
@@ -1014,6 +1179,16 @@ async def on_conversation_delete_confirm(action: cl.Action) -> None:
 async def on_knowledge_list(action: cl.Action) -> None:
     offset = int(action.payload.get("offset", 0))
     await send_knowledge_dashboard(offset)
+
+
+@cl.action_callback("knowledge_sync_sqlserver")
+async def on_knowledge_sync_sqlserver(action: cl.Action) -> None:
+    days = action.payload.get("days")
+    try:
+        normalized_days = max(1, int(days)) if days is not None else None
+    except (TypeError, ValueError):
+        normalized_days = None
+    await run_sqlserver_sync(days=normalized_days)
 
 
 @cl.action_callback("knowledge_set_upload_private")

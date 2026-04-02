@@ -21,11 +21,19 @@ class Command(BaseCommand):
             default=None,
             help="จำกัดจำนวนแถวที่ต้องการ import",
         )
+        parser.add_argument(
+            "--days",
+            dest="days",
+            type=int,
+            default=None,
+            help="ดึงเฉพาะข้อมูลที่ Create_date อยู่ในช่วง N วันล่าสุด",
+        )
 
     def handle(self, *args, **options):
         schema = (options.get("schema") or settings.SQLSERVER_CASES_SCHEMA or "dbo").strip()
         table = (options.get("table") or settings.SQLSERVER_CASES_TABLE or "").strip()
         limit = options.get("limit")
+        days = options.get("days")
 
         if not table:
             raise CommandError(
@@ -37,6 +45,7 @@ class Command(BaseCommand):
                 schema=schema,
                 table=table,
                 limit=limit,
+                days=days,
             )
         except (SQLServerConfigurationError, SQLServerDependencyError) as exc:
             raise CommandError(str(exc)) from exc
@@ -49,6 +58,8 @@ class Command(BaseCommand):
                 f"import เสร็จแล้วจาก {schema}.{table}"
             )
         )
+        if days:
+            self.stdout.write(f"ช่วงข้อมูลล่าสุด: {days} วัน")
         self.stdout.write(f"total rows: {summary.total_rows}")
         self.stdout.write(f"created: {summary.created_count}")
         self.stdout.write(f"updated: {summary.updated_count}")

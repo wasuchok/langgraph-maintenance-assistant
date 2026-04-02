@@ -66,16 +66,24 @@ def fetch_sqlserver_cases(
     schema: str,
     table: str,
     limit: int | None = None,
+    days: int | None = None,
 ) -> list[dict[str, Any]]:
     selected_fields = ",\n            ".join(SQLSERVER_CASE_FIELDS)
     full_table_name = f"{_quote_identifier(schema)}.{_quote_identifier(table)}"
     top_clause = f"TOP {max(1, int(limit))} " if limit else ""
+    where_clauses = ["CARD_ID IS NOT NULL"]
+
+    if days is not None:
+        safe_days = max(1, int(days))
+        where_clauses.append(f"Create_date >= DATEADD(day, -{safe_days}, GETDATE())")
+
+    where_sql = "\n            AND ".join(where_clauses)
 
     query = f"""
         SELECT {top_clause}
             {selected_fields}
         FROM {full_table_name}
-        WHERE CARD_ID IS NOT NULL
+        WHERE {where_sql}
         ORDER BY Create_date DESC, CARD_ID ASC
     """
     return fetch_rows(query)
@@ -180,11 +188,13 @@ def import_sqlserver_cases(
     schema: str,
     table: str,
     limit: int | None = None,
+    days: int | None = None,
 ) -> dict[str, Any]:
     rows = fetch_sqlserver_cases(
         schema=schema,
         table=table,
         limit=limit,
+        days=days,
     )
     summary = SQLServerCaseImportSummary(total_rows=len(rows))
     errors: list[dict[str, str]] = []
@@ -280,6 +290,7 @@ def import_sqlserver_cases(
     return {
         "schema": schema,
         "table": table,
+        "days": days,
         "summary": summary,
         "errors": errors,
     }
