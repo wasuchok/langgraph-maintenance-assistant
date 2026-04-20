@@ -149,8 +149,25 @@ ollama serve
 เปิด Django API
 
 ```bash
-.venv312/bin/python manage.py runserver 0.0.0.0:8000
+./run_api.sh
 ```
+
+ถ้าต้องการโหมด auto-reload สำหรับพัฒนา:
+
+```bash
+RELOAD=true ./run_api.sh
+```
+
+ถ้าต้องการเปลี่ยนพอร์ต:
+
+```bash
+PORT=8001 ./run_api.sh
+```
+
+ค่า default ของ API:
+
+- host: `0.0.0.0`
+- port: `8000`
 
 ## Chainlit
 
